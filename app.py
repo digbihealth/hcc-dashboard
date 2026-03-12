@@ -1,15 +1,15 @@
 import streamlit as st
 import requests
 import pandas as pd
-import json
-from datetime import datetime
 import plotly.express as px
-import plotly.graph_objects as go
+from datetime import datetime
+import json
+import concurrent.futures
+import threading
 
-# ── Page config ──────────────────────────────────────────────────────────────
-st.set_page_config(page_title="High Cost Claimant Dashboard", layout="wide")
+st.set_page_config(page_title="High Cost Claimant Dashboard", layout="wide", page_icon="💊")
 
-# ── Force light mode ─────────────────────────────────────────────────────────
+# ── Force light mode ──────────────────────────────────────────────────────────
 st.markdown("""
 <style>
   [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
@@ -23,10 +23,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-BASE_URL              = "https://api.iterable.com/api"
-LIST_ALL_HCCS         = 8865061   # Digbi_preEnrollment — all HCCs
-LIST_ENROLLED_HCCS    = 8865109   # Digbi Health       — enrolled HCCs
-CUTOFF_2026           = pd.Timestamp("2026-01-01")
+BASE_URL           = "https://api.iterable.com/api"
+LIST_ALL_HCCS      = 8865061   # Digbi_preEnrollment — all HCCs
+LIST_ENROLLED_HCCS = 8865109   # Digbi Health — enrolled HCCs
+CUTOFF_2026        = pd.Timestamp("2026-01-01")
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 def get_headers(project: str) -> dict:
@@ -34,7 +34,7 @@ def get_headers(project: str) -> dict:
         "digbi_health":  st.secrets.get("ITERABLE_KEY_DIGBI_HEALTH", ""),
         "preenrollment": st.secrets.get("ITERABLE_KEY_PREENROLLMENT", ""),
     }
-    return {"Api-Key": key_map[project], "Content-Type": "application/json"}
+    return {"Api-Key": key_map[project]}
 
 # ── Fetch emails from a list ──────────────────────────────────────────────────
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -62,286 +62,267 @@ def fetch_list_emails(project: str, list_id: int) -> list:
                     emails.append(decoded)
     return emails
 
-# ── Batch fetch user profiles ─────────────────────────────────────────────────
+# ── Fetch profiles — threaded GET /users/{email}, fields at top level ─────────
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_user_fields(project: str, emails: tuple, fields: tuple) -> list:
     headers    = get_headers(project)
-    results    = []
-    batch_size = 100
     email_list = list(emails)
-    progress   = st.progress(0, text="Loading user profiles…")
+    results    = []
+    progress   = st.progress(0, text="Loading user profiles...")
+    lock       = threading.Lock()
+    completed  = [0]
 
-    for i in range(0, len(email_list), batch_size):
-        batch = email_list[i:i + batch_size]
+    def fetch_one(email):
         try:
-            resp = requests.post(
-                f"{BASE_URL}/users/bulkGet",
+            r = requests.get(
+                f"{BASE_URL}/users/{requests.utils.quote(email, safe='')}",
                 headers=headers,
-                json={"emails": batch, "fields": list(fields)},
-                timeout=30,
+                timeout=15,
             )
-            if resp.status_code == 200:
-                for u in resp.json().get("users", []):
-                    row = {"email": u.get("email", "")}
-                    row.update(u.get("dataFields", {}))
-                    results.append(row)
-            else:
-                for email in batch:
-                    results.append({"email": email})
+            if r.status_code == 200:
+                user = r.json().get("user", {})
+                # Fields live at TOP LEVEL of user object — not inside dataFields
+                row = {"email": email}
+                for f in fields:
+                    row[f] = user.get(f)
+                return row
         except Exception:
-            for email in batch:
-                results.append({"email": email})
+            pass
+        return {"email": email}
 
-        progress.progress(
-            min(1.0, (i + batch_size) / max(len(email_list), 1)),
-            text=f"Loading profiles… {min(i + batch_size, len(email_list))}/{len(email_list)}"
-        )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(fetch_one, e): e for e in email_list}
+        for future in concurrent.futures.as_completed(futures):
+            results.append(future.result())
+            with lock:
+                completed[0] += 1
+                pct = completed[0] / len(email_list)
+                progress.progress(pct, text=f"Loading user profiles... {completed[0]:,}/{len(email_list):,}")
 
     progress.empty()
     return results
 
-# ── Parse UNIX ms enrollment dates ───────────────────────────────────────────
-def parse_enrollment_dates(df: pd.DataFrame) -> pd.DataFrame:
+# ── Parse enrollmentDate — UNIX milliseconds integer e.g. 1768499984000 ───────
+# NOTE: Never use enrollmentDateFormatted — unreliable across users in Iterable
+def parse_dates(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     if "enrollmentDate" not in df.columns:
-        df["enrollmentDate"] = pd.NaT
-        df["date"]           = pd.NaT
-        df["month"]          = None
-        df["day_of_month"]   = None
+        df["date"]  = pd.NaT
+        df["month"] = None
         return df
-
-    def coerce(val):
-        if pd.isna(val) or val == "" or val is None:
-            return pd.NaT
-        try:
-            ms = float(val)
-            return pd.Timestamp(ms, unit="ms")
-        except Exception:
-            try:
-                return pd.to_datetime(val, errors="coerce")
-            except Exception:
-                return pd.NaT
-
-    df["enrollmentDate"] = df["enrollmentDate"].apply(coerce)
-    df["date"]           = df["enrollmentDate"].dt.normalize()
-    df["month"]          = df["enrollmentDate"].dt.to_period("M").astype(str)
-    df["day_of_month"]   = df["enrollmentDate"].dt.day
+    numeric = pd.to_numeric(df["enrollmentDate"], errors="coerce")
+    df["enrollmentDate"] = pd.to_datetime(numeric, unit="ms", errors="coerce")
+    df["date"]  = df["enrollmentDate"].dt.normalize()
+    df["month"] = df["enrollmentDate"].dt.to_period("M").astype(str)
     return df
 
-# ── Load data ─────────────────────────────────────────────────────────────────
-def load_data():
-    with st.spinner("Fetching HCC list from Iterable…"):
-        all_hcc_emails      = fetch_list_emails("preenrollment", LIST_ALL_HCCS)
-        enrolled_hcc_emails = fetch_list_emails("digbi_health",  LIST_ENROLLED_HCCS)
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ⚙️ Settings")
+    st.markdown("---")
+    if st.button("🔄 Refresh Data", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+    st.caption("Data cached for 30 min.")
 
-    # Profile fields for enrolled users
-    enrolled_fields = ("enrollmentDate", "employerName", "claimCost")
-    with st.spinner("Fetching enrolled HCC profiles…"):
-        enrolled_profiles = fetch_user_fields(
-            "digbi_health",
-            tuple(enrolled_hcc_emails),
-            enrolled_fields,
-        )
-
-    # Profile fields for ALL HCCs (employer breakdown)
-    all_fields = ("employerName", "claimCost")
-    with st.spinner("Fetching all HCC profiles…"):
-        all_profiles = fetch_user_fields(
-            "preenrollment",
-            tuple(all_hcc_emails),
-            all_fields,
-        )
-
-    df_all      = pd.DataFrame(all_profiles)      if all_profiles      else pd.DataFrame()
-    df_enrolled = pd.DataFrame(enrolled_profiles) if enrolled_profiles else pd.DataFrame()
-
-    # Clean employer name
-    for df in [df_all, df_enrolled]:
-        if "employerName" not in df.columns:
-            df["employerName"] = "Unknown"
-        df["employerName"] = df["employerName"].fillna("Unknown").astype(str).str.strip()
-
-    # Parse dates on enrolled
-    df_enrolled = parse_enrollment_dates(df_enrolled)
-
-    # 2026 filter — only users with a known enrollment date on or after Jan 1 2026
-    df_enrolled_2026 = df_enrolled[
-        df_enrolled["date"].notna() & (df_enrolled["date"] >= CUTOFF_2026)
-    ]
-
-    return df_all, df_enrolled, df_enrolled_2026
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Title ─────────────────────────────────────────────────────────────────────
 st.title("💊 High Cost Claimant Dashboard")
 
-if st.button("🔄 Refresh Data"):
-    st.cache_data.clear()
-    st.rerun()
+# ── Key check ─────────────────────────────────────────────────────────────────
+missing = []
+if not st.secrets.get("ITERABLE_KEY_DIGBI_HEALTH"):   missing.append("`ITERABLE_KEY_DIGBI_HEALTH`")
+if not st.secrets.get("ITERABLE_KEY_PREENROLLMENT"):  missing.append("`ITERABLE_KEY_PREENROLLMENT`")
+if missing:
+    st.error(f"Missing API key(s): {', '.join(missing)} — add to Streamlit secrets.")
+    st.stop()
 
-# ── Load ──────────────────────────────────────────────────────────────────────
-df_all, df_enrolled, df_enrolled_2026 = load_data()
+# ── Fetch email lists ─────────────────────────────────────────────────────────
+with st.spinner("Fetching all HCC emails (preEnrollment)..."):
+    try:
+        all_hcc_emails = fetch_list_emails("preenrollment", LIST_ALL_HCCS)
+    except Exception as e:
+        st.error(f"Error fetching HCC list: {e}")
+        st.stop()
 
-total_hccs        = len(df_all)
-total_enrolled    = len(df_enrolled)
-enrolled_rate     = (total_enrolled / total_hccs * 100) if total_hccs else 0.0
-enrolled_2026     = len(df_enrolled_2026)
+with st.spinner("Fetching enrolled HCC emails (Digbi Health)..."):
+    try:
+        enrolled_emails = fetch_list_emails("digbi_health", LIST_ENROLLED_HCCS)
+    except Exception as e:
+        st.error(f"Error fetching enrolled list: {e}")
+        st.stop()
+
+total_hccs     = len(all_hcc_emails)
+total_enrolled = len(enrolled_emails)
+enrolled_rate  = (total_enrolled / total_hccs * 100) if total_hccs else 0.0
+
+# ── Fetch enrolled profiles ───────────────────────────────────────────────────
+enrolled_profiles = fetch_user_fields(
+    "digbi_health",
+    tuple(enrolled_emails),
+    ("enrollmentDate", "employerName"),
+)
+
+df_enrolled = pd.DataFrame(enrolled_profiles) if enrolled_profiles else pd.DataFrame()
+
+if not df_enrolled.empty:
+    df_enrolled["employerName"] = df_enrolled.get("employerName", pd.Series(dtype=str))
+    df_enrolled["employerName"] = df_enrolled["employerName"].fillna("Unknown").astype(str).str.strip()
+    df_enrolled = parse_dates(df_enrolled)
+else:
+    df_enrolled["employerName"] = "Unknown"
+
+# 2026 enrolled — only rows with a known date >= Jan 1 2026
+df_2026 = df_enrolled[
+    df_enrolled["date"].notna() & (df_enrolled["date"] >= CUTOFF_2026)
+] if not df_enrolled.empty else pd.DataFrame()
+
+enrolled_2026      = len(df_2026)
 enrolled_2026_rate = (enrolled_2026 / total_hccs * 100) if total_hccs else 0.0
-# Employer count comes from Digbi Health enrolled profiles — preEnrollment doesn't carry employerName
-total_employers   = df_enrolled["employerName"].nunique() if not df_enrolled.empty else 0
+total_employers    = df_enrolled["employerName"].nunique() if not df_enrolled.empty else 0
+
+has_dates = not df_enrolled.empty and "date" in df_enrolled.columns and df_enrolled["date"].notna().any()
 
 # ── KPI Tiles ─────────────────────────────────────────────────────────────────
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("Total Employers",          f"{total_employers:,}")
 c2.metric("Total HCCs in Database",   f"{total_hccs:,}")
-c3.metric("Enrolled HCCs (All-time)", f"{total_enrolled:,}",  f"{enrolled_rate:.1f}% enrollment rate")
-c4.metric("Enrolled HCCs 2026",       f"{enrolled_2026:,}",   f"{enrolled_2026_rate:.1f}% enrollment rate")
+c3.metric("Enrolled HCCs (All-time)", f"{total_enrolled:,}", f"{enrolled_rate:.1f}% enrollment rate")
+c4.metric("Enrolled HCCs 2026",       f"{enrolled_2026:,}",  f"{enrolled_2026_rate:.1f}% enrollment rate")
 
 st.markdown("---")
 
-# ── Client Summary Table ──────────────────────────────────────────────────────
+# ── Employer Table ────────────────────────────────────────────────────────────
 st.markdown("### By Employer")
 
 if not df_enrolled.empty:
-    # Base: all enrolled HCCs grouped by employer (Digbi Health carries employerName)
-    employer_total = (
-        df_enrolled.groupby("employerName")
-        .size()
-        .reset_index(name="Total Enrolled")
+    emp_all = (
+        df_enrolled.groupby("employerName").size().reset_index(name="Total Enrolled")
     )
+    emp_2026 = (
+        df_2026.groupby("employerName").size().reset_index(name="Total Enrolled 2026")
+    ) if not df_2026.empty else pd.DataFrame(columns=["employerName", "Total Enrolled 2026"])
 
-    # Enrolled 2026 per employer
-    employer_enrolled_2026 = (
-        df_enrolled_2026.groupby("employerName")
-        .size()
-        .reset_index(name="Total Enrolled 2026")
-    ) if not df_enrolled_2026.empty else pd.DataFrame(columns=["employerName", "Total Enrolled 2026"])
-
-    employer_df = employer_total.merge(employer_enrolled_2026, on="employerName", how="left")
-    employer_df["Total Enrolled 2026"] = employer_df["Total Enrolled 2026"].fillna(0).astype(int)
-    employer_df["2026 Enrollment Target (30%)"] = (employer_df["Total Enrolled"] * 0.30).round(0).astype(int)
-    employer_df["Total Enrolled 2026 %"] = (
-        employer_df["Total Enrolled 2026"] / employer_df["Total Enrolled"] * 100
+    emp_df = emp_all.merge(emp_2026, on="employerName", how="left")
+    emp_df["Total Enrolled 2026"] = emp_df["Total Enrolled 2026"].fillna(0).astype(int)
+    emp_df["2026 HCC Enrollment Target (30%)"] = (emp_df["Total Enrolled"] * 0.30).round(0).astype(int)
+    emp_df["Total Enrolled 2026 %"] = (
+        emp_df["Total Enrolled 2026"] / emp_df["Total Enrolled"].replace(0, pd.NA) * 100
     ).round(1).astype(str) + "%"
+    emp_df = emp_df.sort_values("Total Enrolled", ascending=False).reset_index(drop=True)
+    emp_df = emp_df.rename(columns={"employerName": "Employer Name"})
 
-    employer_df = employer_df.sort_values("Total Enrolled", ascending=False).reset_index(drop=True)
-    employer_df = employer_df.rename(columns={"employerName": "Employer Name"})
-
-    # Totals row
-    totals = pd.DataFrame([{
-        "Employer Name":                "TOTAL",
-        "Total Enrolled":               employer_df["Total Enrolled"].sum(),
-        "Total Enrolled 2026":          employer_df["Total Enrolled 2026"].sum(),
-        "2026 Enrollment Target (30%)": employer_df["2026 Enrollment Target (30%)"].sum(),
-        "Total Enrolled 2026 %":        f"{enrolled_2026_rate:.1f}%",
+    totals_row = pd.DataFrame([{
+        "Employer Name":                   "TOTAL",
+        "Total Enrolled":                  emp_df["Total Enrolled"].sum(),
+        "2026 HCC Enrollment Target (30%)": emp_df["2026 HCC Enrollment Target (30%)"].sum(),
+        "Total Enrolled 2026":             emp_df["Total Enrolled 2026"].sum(),
+        "Total Enrolled 2026 %":           f"{enrolled_2026_rate:.1f}%",
     }])
-    employer_display = pd.concat([employer_df, totals], ignore_index=True)
+    emp_display = pd.concat([emp_df, totals_row], ignore_index=True)
 
-    display_cols = [
-        "Employer Name", "Total Enrolled",
-        "2026 Enrollment Target (30%)", "Total Enrolled 2026",
-        "Total Enrolled 2026 %",
-    ]
     st.dataframe(
-        employer_display[display_cols],
+        emp_display[[
+            "Employer Name", "Total Enrolled",
+            "2026 HCC Enrollment Target (30%)", "Total Enrolled 2026",
+            "Total Enrolled 2026 %",
+        ]],
         use_container_width=True,
         hide_index=True,
     )
-    st.caption(f"Showing {len(employer_df)} employers")
+    st.caption(f"Showing {len(emp_df)} employers")
 
 st.markdown("---")
 
-# ── Tabs: By Month | By Day of Month ─────────────────────────────────────────
+# ── Tabs ──────────────────────────────────────────────────────────────────────
 tab1, tab2 = st.tabs(["📅 Enrollments by Month", "📆 Enrollments by Day (Current Month)"])
 
 # ── TAB 1: By Month ───────────────────────────────────────────────────────────
 with tab1:
-    if df_enrolled_2026.empty or "month" not in df_enrolled_2026.columns:
-        st.info("No enrollment date data available.")
+    if not has_dates or df_2026.empty:
+        st.info("No 2026 enrollment date data available.")
     else:
         monthly = (
-            df_enrolled_2026.dropna(subset=["month"])
-            .groupby("month")
-            .size()
+            df_2026.dropna(subset=["month"])
+            .groupby("month").size()
             .reset_index(name="Enrolled")
             .sort_values("month")
         )
         monthly["Cumulative Enrolled"] = monthly["Enrolled"].cumsum()
         monthly["Month"] = pd.to_datetime(monthly["month"]).dt.strftime("%B %Y")
 
-        display_monthly = monthly[["Month", "Enrolled", "Cumulative Enrolled"]].copy()
         st.markdown("#### Enrollments by Month")
-        st.dataframe(display_monthly, use_container_width=True, hide_index=True)
+        st.dataframe(
+            monthly[["Month", "Enrolled", "Cumulative Enrolled"]],
+            use_container_width=True, hide_index=True,
+        )
 
         col_a, col_b = st.columns(2)
         with col_a:
-            fig_bar = px.bar(
-                monthly, x="Month", y="Enrolled",
-                title="Monthly HCC Enrollments",
-                color_discrete_sequence=["#4C78A8"],
-            )
-            fig_bar.update_layout(xaxis_title="", yaxis_title="Enrolled", plot_bgcolor="white")
+            fig_bar = px.bar(monthly, x="Month", y="Enrolled",
+                             title="Monthly HCC Enrollments",
+                             color_discrete_sequence=["#4F86C6"])
+            fig_bar.update_layout(xaxis_title="", yaxis_title="Enrolled",
+                                  plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig_bar, use_container_width=True)
         with col_b:
-            fig_cum = px.area(
-                monthly, x="Month", y="Cumulative Enrolled",
-                title="Cumulative HCC Enrollments",
-                color_discrete_sequence=["#72B7B2"],
-            )
-            fig_cum.update_layout(xaxis_title="", yaxis_title="Cumulative", plot_bgcolor="white")
+            fig_cum = px.area(monthly, x="Month", y="Cumulative Enrolled",
+                              title="Cumulative HCC Enrollments",
+                              color_discrete_sequence=["#5CB85C"])
+            fig_cum.update_layout(xaxis_title="", yaxis_title="Cumulative",
+                                  plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig_cum, use_container_width=True)
 
 # ── TAB 2: By Day (Current Month) ────────────────────────────────────────────
 with tab2:
-    today      = pd.Timestamp.today().normalize()
+    today       = pd.Timestamp.today().normalize()
     month_start = today.replace(day=1)
     month_label = today.strftime("%B %Y")
 
-    if df_enrolled_2026.empty or "date" not in df_enrolled_2026.columns:
+    if not has_dates:
         st.info("No enrollment date data available.")
     else:
-        df_month = df_enrolled_2026[
-            df_enrolled_2026["date"].notna() &
-            (df_enrolled_2026["date"] >= month_start) &
-            (df_enrolled_2026["date"] <= today)
-        ].copy()
+        df_month = df_2026[
+            df_2026["date"].notna() &
+            (df_2026["date"] >= month_start) &
+            (df_2026["date"] <= today)
+        ].copy() if not df_2026.empty else pd.DataFrame()
 
-        # Build full day range for current month up to today
         all_days = pd.date_range(month_start, today, freq="D")
-        day_counts = (
-            df_month.groupby("date").size()
-            .reindex(all_days, fill_value=0)
-            .reset_index()
-        )
+        if not df_month.empty:
+            day_counts = (
+                df_month.groupby("date").size()
+                .reindex(all_days, fill_value=0)
+                .reset_index()
+            )
+        else:
+            day_counts = pd.DataFrame({"index": all_days, 0: 0}).rename(columns={"index": "date", 0: "Enrolled"})
         day_counts.columns = ["date", "Enrolled"]
         day_counts["Cumulative Enrolled"] = day_counts["Enrolled"].cumsum()
         day_counts["Day"] = day_counts["date"].dt.strftime("%a, %b %d")
 
         st.markdown(f"#### Daily Enrollments — {month_label}")
-        display_daily = day_counts[["Day", "Enrolled", "Cumulative Enrolled"]].copy()
-        st.dataframe(display_daily, use_container_width=True, hide_index=True)
+        st.dataframe(
+            day_counts[["Day", "Enrolled", "Cumulative Enrolled"]],
+            use_container_width=True, hide_index=True,
+        )
 
         col_a, col_b = st.columns(2)
         with col_a:
-            fig_day_bar = px.bar(
-                day_counts, x="Day", y="Enrolled",
-                title=f"Daily HCC Enrollments — {month_label}",
-                color_discrete_sequence=["#4C78A8"],
-            )
-            fig_day_bar.update_layout(
-                xaxis_title="", yaxis_title="Enrolled",
-                plot_bgcolor="white",
-                xaxis_tickangle=-45,
-            )
-            st.plotly_chart(fig_day_bar, use_container_width=True)
+            fig_day = px.bar(day_counts, x="Day", y="Enrolled",
+                             title=f"Daily HCC Enrollments — {month_label}",
+                             color_discrete_sequence=["#4F86C6"])
+            fig_day.update_layout(xaxis_title="", yaxis_title="Enrolled",
+                                  plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                                  xaxis_tickangle=-45)
+            st.plotly_chart(fig_day, use_container_width=True)
         with col_b:
-            fig_day_cum = px.area(
-                day_counts, x="Day", y="Cumulative Enrolled",
-                title=f"Cumulative HCC Enrollments — {month_label}",
-                color_discrete_sequence=["#72B7B2"],
-            )
-            fig_day_cum.update_layout(
-                xaxis_title="", yaxis_title="Cumulative",
-                plot_bgcolor="white",
-                xaxis_tickangle=-45,
-            )
+            fig_day_cum = px.area(day_counts, x="Day", y="Cumulative Enrolled",
+                                  title=f"Cumulative HCC Enrollments — {month_label}",
+                                  color_discrete_sequence=["#5CB85C"])
+            fig_day_cum.update_layout(xaxis_title="", yaxis_title="Cumulative",
+                                      plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                                      xaxis_tickangle=-45)
             st.plotly_chart(fig_day_cum, use_container_width=True)
+
+st.markdown("---")
+st.caption(f"Last loaded: {datetime.now().strftime('%b %d, %Y %I:%M %p')} · Source: Iterable API")
