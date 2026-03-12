@@ -174,14 +174,6 @@ enrolled_profiles = fetch_user_fields(
 
 df_enrolled = pd.DataFrame(enrolled_profiles) if enrolled_profiles else pd.DataFrame()
 
-# ── DEBUG — remove once data is confirmed correct ─────────────────────────────
-with st.expander("🔍 Debug: Raw profile data (first 5 rows)", expanded=True):
-    st.write(f"Total profiles returned: {len(df_enrolled)}")
-    st.write(f"Columns present: {list(df_enrolled.columns)}")
-    if not df_enrolled.empty:
-        st.dataframe(df_enrolled.head(5))
-# ── END DEBUG ─────────────────────────────────────────────────────────────────
-
 if not df_enrolled.empty:
     df_enrolled["employerName"] = df_enrolled.get("employerName", pd.Series(dtype=str))
     df_enrolled["employerName"] = df_enrolled["employerName"].fillna("Unknown").astype(str).str.strip()
