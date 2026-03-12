@@ -110,8 +110,17 @@ def parse_dates(df: pd.DataFrame) -> pd.DataFrame:
         df["date"]  = pd.NaT
         df["month"] = None
         return df
-    numeric = pd.to_numeric(df["enrollmentDate"], errors="coerce")
-    df["enrollmentDate"] = pd.to_datetime(numeric, unit="ms", errors="coerce")
+    def coerce_ms(val):
+        """Convert UNIX ms integer to Timestamp safely — avoids FloatingPointError on overflow."""
+        try:
+            ms = float(val)
+            if pd.isna(ms):
+                return pd.NaT
+            return pd.Timestamp(ms, unit="ms")
+        except Exception:
+            return pd.NaT
+
+    df["enrollmentDate"] = df["enrollmentDate"].apply(coerce_ms)
     df["date"]  = df["enrollmentDate"].dt.normalize()
     df["month"] = df["enrollmentDate"].dt.to_period("M").astype(str)
     return df
