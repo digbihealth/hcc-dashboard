@@ -220,21 +220,14 @@ st.markdown("---")
 st.markdown("### By Employer")
 
 if not df_enrolled.empty:
-    # Check if preEnrollment data has meaningful employer breakdown (>1 employer)
+    # Per-employer HCC counts — only use df_all if preEnrollment profiles
+    # actually returned employerName for most users (>50% non-Unknown)
     all_has_employers = (
         not df_all.empty
-        and df_all["employerName"].nunique() > 1
-        and (df_all["employerName"] != "Unknown").any()
+        and (df_all["employerName"] != "Unknown").sum() > len(df_all) * 0.5
     )
 
-    if all_has_employers:
-        # Use preEnrollment for Total HCCs per employer (full universe)
-        hcc_by_employer = df_all.groupby("employerName").size().reset_index(name="Total HCCs")
-    else:
-        # Fall back: derive Total HCCs from enrolled list employer names
-        hcc_by_employer = df_enrolled.groupby("employerName").size().reset_index(name="Total HCCs")
-
-    # All-time enrolled per employer
+    # All-time enrolled per employer (always reliable — from Digbi Health)
     enrolled_by_employer = df_enrolled.groupby("employerName").size().reset_index(name="Total Enrolled (All-time)")
 
     # 2026 enrolled per employer
@@ -242,49 +235,76 @@ if not df_enrolled.empty:
         df_2026.groupby("employerName").size().reset_index(name="Total Enrolled 2026")
     ) if not df_2026.empty else pd.DataFrame(columns=["employerName", "Total Enrolled 2026"])
 
-    emp_df = (
-        hcc_by_employer
-        .merge(enrolled_by_employer,      on="employerName", how="left")
-        .merge(enrolled_2026_by_employer, on="employerName", how="left")
-    )
-    emp_df["Total Enrolled (All-time)"] = emp_df["Total Enrolled (All-time)"].fillna(0).astype(int)
-    emp_df["Total Enrolled 2026"]       = emp_df["Total Enrolled 2026"].fillna(0).astype(int)
-    emp_df["2026 Enrollment Target (30%)"] = (emp_df["Total HCCs"] * 0.30).round(0).astype(int)
-    emp_df["Total Enrolled %"] = (
-        emp_df["Total Enrolled (All-time)"] / emp_df["Total HCCs"].replace(0, pd.NA) * 100
-    ).round(1).astype(str) + "%"
-    emp_df["Total Enrolled 2026 %"] = (
-        emp_df["Total Enrolled 2026"] / emp_df["Total HCCs"].replace(0, pd.NA) * 100
-    ).round(1).astype(str) + "%"
+    if all_has_employers:
+        # preEnrollment has good employer data — use it as the HCC universe base
+        hcc_by_employer = df_all.groupby("employerName").size().reset_index(name="Total HCCs")
+        emp_df = (
+            hcc_by_employer
+            .merge(enrolled_by_employer,      on="employerName", how="left")
+            .merge(enrolled_2026_by_employer, on="employerName", how="left")
+        )
+        emp_df["Total Enrolled (All-time)"] = emp_df["Total Enrolled (All-time)"].fillna(0).astype(int)
+        emp_df["Total Enrolled 2026"]       = emp_df["Total Enrolled 2026"].fillna(0).astype(int)
+        emp_df["2026 Enrollment Target (30%)"] = (emp_df["Total HCCs"] * 0.30).round(0).astype(int)
+        emp_df["Total Enrolled %"] = (
+            emp_df["Total Enrolled (All-time)"] / emp_df["Total HCCs"].replace(0, pd.NA) * 100
+        ).round(1).astype(str) + "%"
+        emp_df["Total Enrolled 2026 %"] = (
+            emp_df["Total Enrolled 2026"] / emp_df["Total HCCs"].replace(0, pd.NA) * 100
+        ).round(1).astype(str) + "%"
+        emp_df = emp_df.sort_values("Total HCCs", ascending=False).reset_index(drop=True)
+        emp_df = emp_df.rename(columns={"employerName": "Employer Name"})
 
-    emp_df = emp_df.sort_values("Total HCCs", ascending=False).reset_index(drop=True)
-    emp_df = emp_df.rename(columns={"employerName": "Employer Name"})
+        total_alltime  = emp_df["Total Enrolled (All-time)"].sum()
+        total_hccs_sum = emp_df["Total HCCs"].sum()
+        totals_row = pd.DataFrame([{
+            "Employer Name":                "TOTAL",
+            "Total HCCs":                   total_hccs_sum,
+            "Total Enrolled (All-time)":    total_alltime,
+            "Total Enrolled %":             f"{(total_alltime / total_hccs_sum * 100):.1f}%" if total_hccs_sum else "0.0%",
+            "2026 Enrollment Target (30%)": emp_df["2026 Enrollment Target (30%)"].sum(),
+            "Total Enrolled 2026":          emp_df["Total Enrolled 2026"].sum(),
+            "Total Enrolled 2026 %":        f"{enrolled_2026_rate:.1f}%",
+        }])
+        emp_display = pd.concat([emp_df, totals_row], ignore_index=True)
+        st.dataframe(
+            emp_display[[
+                "Employer Name", "Total HCCs",
+                "Total Enrolled (All-time)", "Total Enrolled %",
+                "2026 Enrollment Target (30%)",
+                "Total Enrolled 2026", "Total Enrolled 2026 %",
+            ]],
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        # preEnrollment employer data unreliable — show enrollment-only table
+        # (Total HCCs per employer not available; use overall list count in TOTAL row)
+        emp_df = enrolled_by_employer.merge(enrolled_2026_by_employer, on="employerName", how="left")
+        emp_df["Total Enrolled (All-time)"] = emp_df["Total Enrolled (All-time)"].fillna(0).astype(int)
+        emp_df["Total Enrolled 2026"]       = emp_df["Total Enrolled 2026"].fillna(0).astype(int)
+        emp_df["Total Enrolled 2026 %"] = (
+            emp_df["Total Enrolled 2026"] / emp_df["Total Enrolled (All-time)"].replace(0, pd.NA) * 100
+        ).round(1).astype(str) + "%"
+        emp_df = emp_df.sort_values("Total Enrolled (All-time)", ascending=False).reset_index(drop=True)
+        emp_df = emp_df.rename(columns={"employerName": "Employer Name"})
 
-    total_alltime     = emp_df["Total Enrolled (All-time)"].sum()
-    total_hccs_sum    = emp_df["Total HCCs"].sum()
-    total_alltime_pct = f"{(total_alltime / total_hccs_sum * 100):.1f}%" if total_hccs_sum else "0.0%"
+        totals_row = pd.DataFrame([{
+            "Employer Name":             "TOTAL",
+            "Total Enrolled (All-time)": emp_df["Total Enrolled (All-time)"].sum(),
+            "Total Enrolled 2026":       emp_df["Total Enrolled 2026"].sum(),
+            "Total Enrolled 2026 %":     f"{enrolled_2026_rate:.1f}%",
+        }])
+        emp_display = pd.concat([emp_df, totals_row], ignore_index=True)
+        st.dataframe(
+            emp_display[[
+                "Employer Name",
+                "Total Enrolled (All-time)",
+                "Total Enrolled 2026", "Total Enrolled 2026 %",
+            ]],
+            use_container_width=True, hide_index=True,
+        )
+        st.caption("⚠️ Total HCCs per employer unavailable — employer field not returned by preEnrollment profiles.")
 
-    totals_row = pd.DataFrame([{
-        "Employer Name":               "TOTAL",
-        "Total HCCs":                  total_hccs_sum,
-        "Total Enrolled (All-time)":   total_alltime,
-        "Total Enrolled %":            total_alltime_pct,
-        "2026 Enrollment Target (30%)": emp_df["2026 Enrollment Target (30%)"].sum(),
-        "Total Enrolled 2026":         emp_df["Total Enrolled 2026"].sum(),
-        "Total Enrolled 2026 %":       f"{enrolled_2026_rate:.1f}%",
-    }])
-    emp_display = pd.concat([emp_df, totals_row], ignore_index=True)
-
-    st.dataframe(
-        emp_display[[
-            "Employer Name", "Total HCCs",
-            "Total Enrolled (All-time)", "Total Enrolled %",
-            "2026 Enrollment Target (30%)",
-            "Total Enrolled 2026", "Total Enrolled 2026 %",
-        ]],
-        use_container_width=True,
-        hide_index=True,
-    )
     st.caption(f"Showing {len(emp_df)} employers")
 
 st.markdown("---")
