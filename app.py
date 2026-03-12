@@ -164,9 +164,9 @@ def load_data():
     # Parse dates on enrolled
     df_enrolled = parse_enrollment_dates(df_enrolled)
 
-    # 2026 filter for enrolled
+    # 2026 filter — only users with a known enrollment date on or after Jan 1 2026
     df_enrolled_2026 = df_enrolled[
-        df_enrolled["date"].isna() | (df_enrolled["date"] >= CUTOFF_2026)
+        df_enrolled["date"].notna() & (df_enrolled["date"] >= CUTOFF_2026)
     ]
 
     return df_all, df_enrolled, df_enrolled_2026
@@ -186,7 +186,8 @@ total_enrolled    = len(df_enrolled)
 enrolled_rate     = (total_enrolled / total_hccs * 100) if total_hccs else 0.0
 enrolled_2026     = len(df_enrolled_2026)
 enrolled_2026_rate = (enrolled_2026 / total_hccs * 100) if total_hccs else 0.0
-total_employers   = df_all["employerName"].nunique() if not df_all.empty else 0
+# Employer count comes from Digbi Health enrolled profiles — preEnrollment doesn't carry employerName
+total_employers   = df_enrolled["employerName"].nunique() if not df_enrolled.empty else 0
 
 # ── KPI Tiles ─────────────────────────────────────────────────────────────────
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -200,58 +201,45 @@ st.markdown("---")
 # ── Client Summary Table ──────────────────────────────────────────────────────
 st.markdown("### By Employer")
 
-if not df_all.empty:
-    # Total HCCs per employer
+if not df_enrolled.empty:
+    # Base: all enrolled HCCs grouped by employer (Digbi Health carries employerName)
     employer_total = (
-        df_all.groupby("employerName")
+        df_enrolled.groupby("employerName")
         .size()
-        .reset_index(name="Total HCCs")
+        .reset_index(name="Total Enrolled")
     )
 
     # Enrolled 2026 per employer
-    employer_enrolled = (
+    employer_enrolled_2026 = (
         df_enrolled_2026.groupby("employerName")
         .size()
         .reset_index(name="Total Enrolled 2026")
     ) if not df_enrolled_2026.empty else pd.DataFrame(columns=["employerName", "Total Enrolled 2026"])
 
-    # Enrolled all-time per employer
-    employer_enrolled_all = (
-        df_enrolled.groupby("employerName")
-        .size()
-        .reset_index(name="Total Enrolled")
-    ) if not df_enrolled.empty else pd.DataFrame(columns=["employerName", "Total Enrolled"])
-
-    employer_df = (
-        employer_total
-        .merge(employer_enrolled_all, on="employerName", how="left")
-        .merge(employer_enrolled,     on="employerName", how="left")
-    )
-    employer_df["Total Enrolled"]      = employer_df["Total Enrolled"].fillna(0).astype(int)
+    employer_df = employer_total.merge(employer_enrolled_2026, on="employerName", how="left")
     employer_df["Total Enrolled 2026"] = employer_df["Total Enrolled 2026"].fillna(0).astype(int)
-    employer_df["2026 Enrollment Target (30%)"] = (employer_df["Total HCCs"] * 0.30).round(0).astype(int)
+    employer_df["2026 Enrollment Target (30%)"] = (employer_df["Total Enrolled"] * 0.30).round(0).astype(int)
     employer_df["Total Enrolled 2026 %"] = (
-        employer_df["Total Enrolled 2026"] / employer_df["Total HCCs"] * 100
+        employer_df["Total Enrolled 2026"] / employer_df["Total Enrolled"] * 100
     ).round(1).astype(str) + "%"
 
-    employer_df = employer_df.sort_values("Total HCCs", ascending=False).reset_index(drop=True)
+    employer_df = employer_df.sort_values("Total Enrolled", ascending=False).reset_index(drop=True)
     employer_df = employer_df.rename(columns={"employerName": "Employer Name"})
 
     # Totals row
     totals = pd.DataFrame([{
-        "Employer Name":               "TOTAL",
-        "Total HCCs":                  employer_df["Total HCCs"].sum(),
-        "Total Enrolled":              employer_df["Total Enrolled"].sum(),
-        "Total Enrolled 2026":         employer_df["Total Enrolled 2026"].sum(),
+        "Employer Name":                "TOTAL",
+        "Total Enrolled":               employer_df["Total Enrolled"].sum(),
+        "Total Enrolled 2026":          employer_df["Total Enrolled 2026"].sum(),
         "2026 Enrollment Target (30%)": employer_df["2026 Enrollment Target (30%)"].sum(),
-        "Total Enrolled 2026 %":       f"{enrolled_2026_rate:.1f}%",
+        "Total Enrolled 2026 %":        f"{enrolled_2026_rate:.1f}%",
     }])
     employer_display = pd.concat([employer_df, totals], ignore_index=True)
 
     display_cols = [
-        "Employer Name", "Total HCCs",
+        "Employer Name", "Total Enrolled",
         "2026 Enrollment Target (30%)", "Total Enrolled 2026",
-        "Total Enrolled 2026 %", "Total Enrolled",
+        "Total Enrolled 2026 %",
     ]
     st.dataframe(
         employer_display[display_cols],
