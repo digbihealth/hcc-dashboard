@@ -184,6 +184,8 @@ all_hcc_profiles = fetch_user_fields(
 )
 df_all = pd.DataFrame(all_hcc_profiles) if all_hcc_profiles else pd.DataFrame()
 if not df_all.empty:
+    if "employerName" not in df_all.columns:
+        df_all["employerName"] = "Unknown"
     df_all["employerName"] = df_all["employerName"].fillna("Unknown").astype(str).str.strip()
 
 # ── 2026 enrolled ─────────────────────────────────────────────────────────────
