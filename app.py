@@ -81,10 +81,11 @@ def fetch_user_fields(project: str, emails: tuple, fields: tuple) -> list:
             )
             if r.status_code == 200:
                 user = r.json().get("user", {})
-                # Fields live at TOP LEVEL of user object — not inside dataFields
+                # Fields are inside dataFields when using GET /users/{email}
+                data_fields = user.get("dataFields", {})
                 row = {"email": email}
                 for f in fields:
-                    row[f] = user.get(f)
+                    row[f] = data_fields.get(f)
                 return row
         except Exception:
             pass
